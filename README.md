@@ -17,7 +17,7 @@ Context thresholds are a percentage of the session's context window, resolved in
 
 1. **Compaction-window override** — `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var, then `autoCompactWindow` in `<cwd>/.claude/settings.local.json`, `<cwd>/.claude/settings.json`, `~/.claude/settings.json` (clamped to 100k–1M)
 2. **Live window from the window-probe mod** — the engine's own `context_window_size` for the current model, cached per session (see [Window probe](#window-probe-mod)); follows `/model` switches
-3. **Model family** of the latest main-chain transcript entry — Opus / Fable → 1,000,000; Sonnet / Haiku → 250,000
+3. **Model family** of the latest main-chain transcript entry — Opus / Fable / Sonnet → 1,000,000; Haiku → 200,000 (the windows the engine reports)
 4. Default → 200,000
 
 If the observed context is already larger than the resolved window, the session must be on the extended window, so it is treated as 1,000,000.

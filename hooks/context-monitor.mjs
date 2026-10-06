@@ -670,8 +670,8 @@ var CONTEXT_CRITICAL_PCT = 0.9;
 var DEFAULT_WINDOW = 2e5;
 var EXTENDED_WINDOW = 1e6;
 var WINDOW_BY_MODEL_FAMILY = [
-  [/opus|fable/i, 1e6],
-  [/sonnet|haiku/i, 25e4]
+  [/opus|fable|sonnet/i, 1e6],
+  [/haiku/i, 2e5]
 ];
 var MIN_WINDOW = 1e5;
 var MAX_WINDOW = 1e6;

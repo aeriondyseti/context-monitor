@@ -23,10 +23,11 @@ const CONTEXT_CRITICAL_PCT = 0.9;
 // ── Context window (tokens) ─────────────────────────────────────────────────
 const DEFAULT_WINDOW = 200_000;
 const EXTENDED_WINDOW = 1_000_000;
-// Fallback when the window-probe mod hasn't cached the live window.
+// Fallback when the window-probe mod hasn't cached the live window; values are
+// what the engine reports for each family.
 const WINDOW_BY_MODEL_FAMILY: [RegExp, number][] = [
-    [/opus|fable/i, 1_000_000],
-    [/sonnet|haiku/i, 250_000],
+    [/opus|fable|sonnet/i, 1_000_000],
+    [/haiku/i, 200_000],
 ];
 // Claude Code's documented bounds for `autoCompactWindow`.
 const MIN_WINDOW = 100_000;
@@ -221,7 +222,7 @@ function windowForModel(model: string | undefined): number {
  * Resolve the session's context window:
  *   1. CLAUDE_CODE_AUTO_COMPACT_WINDOW / `autoCompactWindow` (local > project > user)
  *   2. the live window cached by the window-probe mod (follows `/model`)
- *   3. the model family of the latest transcript entry (Opus/Fable 1M, Sonnet/Haiku 250k)
+ *   3. the model family of the latest transcript entry (Opus/Fable/Sonnet 1M, Haiku 200k)
  *   4. the 200k default
  * A context already larger than the resolved window can only mean the session
  * is on the extended window, so that bumps it to 1M.
