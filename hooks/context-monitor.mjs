@@ -36,7 +36,7 @@ var require_emoji_regex = __commonJS({
 
 // src/context-monitor.ts
 import { existsSync, mkdirSync, openSync, readFileSync as readFileSync2, readSync, closeSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 // node_modules/@aeriondyseti/plugin-kit/dist/chunk-534DPWH2.js
@@ -664,9 +664,13 @@ function runHook(fn) {
 }
 
 // src/context-monitor.ts
-var CONTEXT_WARN = 1e5;
-var CONTEXT_STRONG = 15e4;
-var CONTEXT_CRITICAL = 2e5;
+var CONTEXT_WARN_PCT = 0.5;
+var CONTEXT_STRONG_PCT = 0.75;
+var CONTEXT_CRITICAL_PCT = 0.9;
+var DEFAULT_WINDOW = 2e5;
+var EXTENDED_WINDOW = 1e6;
+var MIN_WINDOW = 1e5;
+var MAX_WINDOW = 1e6;
 var COMPRESS_WARN = 2;
 var COMPRESS_STRONG = 4;
 var COMPRESS_CRITICAL = 6;
@@ -732,21 +736,48 @@ function analyzeTranscript(transcriptPath, state) {
   }
   return state;
 }
+function readSettings(path) {
+  try {
+    return JSON.parse(readFileSync2(path, "utf8"));
+  } catch {
+    return {};
+  }
+}
+function parseWindow(value) {
+  const n = typeof value === "string" ? Number(value.trim()) : value;
+  if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return null;
+  return Math.min(MAX_WINDOW, Math.max(MIN_WINDOW, Math.round(n)));
+}
+function resolveContextWindow(input, ctx) {
+  const settingsFiles = [
+    ...input.cwd ? [join(input.cwd, ".claude", "settings.local.json"), join(input.cwd, ".claude", "settings.json")] : [],
+    join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"), "settings.json")
+  ];
+  const settings = settingsFiles.map(readSettings);
+  let window = parseWindow(process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW) ?? settings.map((s) => parseWindow(s.autoCompactWindow)).find((w) => w !== null) ?? null;
+  if (window === null) {
+    const model = input.model ?? settings.map((s) => s.model).find((m) => typeof m === "string");
+    window = typeof model === "string" && /\[1m\]/i.test(model) ? EXTENDED_WINDOW : DEFAULT_WINDOW;
+  }
+  return ctx > window ? Math.max(window, EXTENDED_WINDOW) : window;
+}
 function maxSeverity(a, b) {
   return SEVERITY_ORDER.indexOf(a) >= SEVERITY_ORDER.indexOf(b) ? a : b;
 }
-function evaluate(state) {
+function evaluate(state, contextWindow) {
   const { context_length: ctx, compressions } = state;
   const issues = [];
   let severity = "info";
-  if (ctx >= CONTEXT_CRITICAL) {
-    issues.push(`Context size is ${ctx.toLocaleString()} tokens (near compression limit)`);
+  const pct = ctx / contextWindow;
+  const size = `${ctx.toLocaleString()} tokens (${Math.round(pct * 100)}% of ${contextWindow.toLocaleString()})`;
+  if (pct >= CONTEXT_CRITICAL_PCT) {
+    issues.push(`Context size is ${size} \u2014 near compression limit`);
     severity = maxSeverity(severity, "critical");
-  } else if (ctx >= CONTEXT_STRONG) {
-    issues.push(`Context size is ${ctx.toLocaleString()} tokens (compression approaching)`);
+  } else if (pct >= CONTEXT_STRONG_PCT) {
+    issues.push(`Context size is ${size} \u2014 compression approaching`);
     severity = maxSeverity(severity, "strong");
-  } else if (ctx >= CONTEXT_WARN) {
-    issues.push(`Context size is ${ctx.toLocaleString()} tokens`);
+  } else if (pct >= CONTEXT_WARN_PCT) {
+    issues.push(`Context size is ${size}`);
     severity = maxSeverity(severity, "warn");
   }
   const cWord = compressions === 1 ? "compression" : "compressions";
@@ -829,7 +860,7 @@ function runStop(input, throttled) {
   }
   const prevOffset = state.last_offset;
   state = analyzeTranscript(input.transcript_path, state);
-  const verdict = evaluate(state);
+  const verdict = evaluate(state, resolveContextWindow(input, state.context_length));
   state.last_checked_at = Date.now();
   if (state.last_offset !== prevOffset || throttled) {
     saveState(input.session_id, state);

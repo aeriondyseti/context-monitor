@@ -8,8 +8,19 @@ It does one thing: read the live token count out of the transcript, count how ma
 
 | Signal               | Note                          | Warn   | Strong  | Critical |
 | -------------------- | ----------------------------- | ------ | ------- | -------- |
-| Context size (tokens) | latest main-chain transcript entry | 100k | 150k | 200k |
+| Context size (% of window) | latest main-chain transcript entry | 50% | 75% | 90% |
 | Compactions          | counted via `SessionStart` (matcher: `compact`) | 2 | 4 | 6 |
+
+### Context window
+
+Context thresholds are a percentage of the session's context window, resolved in the same order Claude Code configures it:
+
+1. `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var
+2. `autoCompactWindow` in settings — `<cwd>/.claude/settings.local.json`, then `<cwd>/.claude/settings.json`, then `~/.claude/settings.json` (clamped to 100k–1M)
+3. A `[1m]` model alias (e.g. `opus[1m]`) in the hook input or settings `model` → 1,000,000
+4. Default → 200,000
+
+If the observed context is already larger than the resolved window, the session must be on the extended window, so it is treated as 1,000,000.
 
 Token count = `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` from the most recent main-chain entry, matching ccstatusline's accounting. Sidechain (subagent) entries and API errors are excluded.
 
@@ -32,9 +43,9 @@ Healthy session: empty JSON output (no notification).
 When a threshold trips, a boxed message is shown to the user, e.g.:
 
 ```
-┌─ · Session health warning ──────────────────────────────────┐
-│ ⚠ Context size is 175,000 tokens (compression approaching) │
-└─────────────────────────────────────────────────────────────┘
+┌─ · Session health warning ──────────────────────────────────────────────────┐
+│ ⚠ Context size is 160,000 tokens (80% of 200,000) — compression approaching │
+└─────────────────────────────────────────────────────────────────────────────┘
 ▸ Finish the current task, commit, and start a new session to preserve quality.
 ```
 

@@ -11,14 +11,21 @@
  * via the matching event class so the wire format stays correct.
  */
 import { existsSync, mkdirSync, openSync, readFileSync, readSync, closeSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ICONS, OutputBuilder, PostToolUse, SessionStart, Stop, runHook } from '@aeriondyseti/plugin-kit';
 
-// ── Thresholds (tokens) ─────────────────────────────────────────────────────
-const CONTEXT_WARN = 100_000;
-const CONTEXT_STRONG = 150_000;
-const CONTEXT_CRITICAL = 200_000;
+// ── Thresholds (fraction of the context window) ─────────────────────────────
+const CONTEXT_WARN_PCT = 0.5;
+const CONTEXT_STRONG_PCT = 0.75;
+const CONTEXT_CRITICAL_PCT = 0.9;
+
+// ── Context window (tokens) ─────────────────────────────────────────────────
+// Claude Code's documented bounds for `autoCompactWindow`.
+const DEFAULT_WINDOW = 200_000;
+const EXTENDED_WINDOW = 1_000_000;
+const MIN_WINDOW = 100_000;
+const MAX_WINDOW = 1_000_000;
 
 // ── Thresholds (compression count) ──────────────────────────────────────────
 const COMPRESS_WARN = 2;
@@ -43,6 +50,8 @@ interface MonitorState {
 interface CommonHookFields {
     session_id: string;
     transcript_path?: string;
+    cwd?: string;
+    model?: string;
 }
 
 interface TranscriptEntry {
@@ -145,6 +154,58 @@ function analyzeTranscript(transcriptPath: string, state: MonitorState): Monitor
     return state;
 }
 
+// ── Context window resolution ───────────────────────────────────────────────
+
+interface ClaudeSettings {
+    autoCompactWindow?: unknown;
+    model?: unknown;
+}
+
+function readSettings(path: string): ClaudeSettings {
+    try {
+        return JSON.parse(readFileSync(path, 'utf8')) as ClaudeSettings;
+    } catch {
+        return {};
+    }
+}
+
+function parseWindow(value: unknown): number | null {
+    const n = typeof value === 'string' ? Number(value.trim()) : value;
+    if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) return null;
+    return Math.min(MAX_WINDOW, Math.max(MIN_WINDOW, Math.round(n)));
+}
+
+/**
+ * Resolve the session's context window, mirroring how Claude Code configures it:
+ *   1. CLAUDE_CODE_AUTO_COMPACT_WINDOW env var (per-session override)
+ *   2. `autoCompactWindow` from settings (local > project > user)
+ *   3. a `[1m]` model alias (hook input or settings) → 1M
+ *   4. the 200k default
+ * A context already larger than the resolved window can only mean the session
+ * is on the extended window, so that bumps it to 1M.
+ */
+function resolveContextWindow(input: CommonHookFields, ctx: number): number {
+    const settingsFiles = [
+        ...(input.cwd
+            ? [join(input.cwd, '.claude', 'settings.local.json'), join(input.cwd, '.claude', 'settings.json')]
+            : []),
+        join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'settings.json'),
+    ];
+    const settings = settingsFiles.map(readSettings);
+
+    let window =
+        parseWindow(process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW) ??
+        settings.map((s) => parseWindow(s.autoCompactWindow)).find((w) => w !== null) ??
+        null;
+
+    if (window === null) {
+        const model = input.model ?? settings.map((s) => s.model).find((m) => typeof m === 'string');
+        window = typeof model === 'string' && /\[1m\]/i.test(model) ? EXTENDED_WINDOW : DEFAULT_WINDOW;
+    }
+
+    return ctx > window ? Math.max(window, EXTENDED_WINDOW) : window;
+}
+
 // ── Evaluation ──────────────────────────────────────────────────────────────
 
 function maxSeverity(a: Severity, b: Severity): Severity {
@@ -157,19 +218,21 @@ interface Verdict {
     advice: string;
 }
 
-function evaluate(state: MonitorState): Verdict | null {
+function evaluate(state: MonitorState, contextWindow: number): Verdict | null {
     const { context_length: ctx, compressions } = state;
     const issues: string[] = [];
     let severity: Severity = 'info';
 
-    if (ctx >= CONTEXT_CRITICAL) {
-        issues.push(`Context size is ${ctx.toLocaleString()} tokens (near compression limit)`);
+    const pct = ctx / contextWindow;
+    const size = `${ctx.toLocaleString()} tokens (${Math.round(pct * 100)}% of ${contextWindow.toLocaleString()})`;
+    if (pct >= CONTEXT_CRITICAL_PCT) {
+        issues.push(`Context size is ${size} — near compression limit`);
         severity = maxSeverity(severity, 'critical');
-    } else if (ctx >= CONTEXT_STRONG) {
-        issues.push(`Context size is ${ctx.toLocaleString()} tokens (compression approaching)`);
+    } else if (pct >= CONTEXT_STRONG_PCT) {
+        issues.push(`Context size is ${size} — compression approaching`);
         severity = maxSeverity(severity, 'strong');
-    } else if (ctx >= CONTEXT_WARN) {
-        issues.push(`Context size is ${ctx.toLocaleString()} tokens`);
+    } else if (pct >= CONTEXT_WARN_PCT) {
+        issues.push(`Context size is ${size}`);
         severity = maxSeverity(severity, 'warn');
     }
 
@@ -274,7 +337,7 @@ function runStop(input: CommonHookFields, throttled: boolean): void {
 
     const prevOffset = state.last_offset;
     state = analyzeTranscript(input.transcript_path, state);
-    const verdict = evaluate(state);
+    const verdict = evaluate(state, resolveContextWindow(input, state.context_length));
     state.last_checked_at = Date.now();
 
     if (state.last_offset !== prevOffset || throttled) {
