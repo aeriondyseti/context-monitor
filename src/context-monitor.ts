@@ -21,9 +21,14 @@ const CONTEXT_STRONG_PCT = 0.75;
 const CONTEXT_CRITICAL_PCT = 0.9;
 
 // ── Context window (tokens) ─────────────────────────────────────────────────
-// Claude Code's documented bounds for `autoCompactWindow`.
 const DEFAULT_WINDOW = 200_000;
 const EXTENDED_WINDOW = 1_000_000;
+// Fallback when the window-probe mod hasn't cached the live window.
+const WINDOW_BY_MODEL_FAMILY: [RegExp, number][] = [
+    [/opus|fable/i, 1_000_000],
+    [/sonnet|haiku/i, 250_000],
+];
+// Claude Code's documented bounds for `autoCompactWindow`.
 const MIN_WINDOW = 100_000;
 const MAX_WINDOW = 1_000_000;
 
@@ -45,17 +50,18 @@ interface MonitorState {
     compressions: number;
     context_length: number;
     last_checked_at: number;
+    model?: string;
 }
 
 interface CommonHookFields {
     session_id: string;
     transcript_path?: string;
     cwd?: string;
-    model?: string;
 }
 
 interface TranscriptEntry {
     message?: {
+        model?: string;
         usage?: {
             input_tokens?: number;
             cache_read_input_tokens?: number;
@@ -75,6 +81,10 @@ function getStatePath(sessionId: string): string {
     mkdirSync(STATE_DIR, { recursive: true });
     const safe = sessionId.replace(/[^a-zA-Z0-9-]/g, '_');
     return join(STATE_DIR, `${safe}.json`);
+}
+
+function getWindowCachePath(sessionId: string): string {
+    return getStatePath(sessionId).replace(/\.json$/, '.window.json');
 }
 
 function loadState(sessionId: string): MonitorState {
@@ -119,6 +129,7 @@ function analyzeTranscript(transcriptPath: string, state: MonitorState): Monitor
         closeSync(fd);
 
         let mostRecentUsage: TranscriptUsage | null = null;
+        let mostRecentModel: string | undefined;
         let mostRecentTime: Date | null = null;
 
         for (const line of buffer.toString('utf8').split('\n')) {
@@ -138,6 +149,7 @@ function analyzeTranscript(transcriptPath: string, state: MonitorState): Monitor
             if (!mostRecentTime || t > mostRecentTime) {
                 mostRecentTime = t;
                 mostRecentUsage = usage;
+                mostRecentModel = entry.message?.model;
             }
         }
 
@@ -146,6 +158,7 @@ function analyzeTranscript(transcriptPath: string, state: MonitorState): Monitor
                 (mostRecentUsage.input_tokens ?? 0) +
                 (mostRecentUsage.cache_read_input_tokens ?? 0) +
                 (mostRecentUsage.cache_creation_input_tokens ?? 0);
+            if (mostRecentModel) state.model = mostRecentModel;
         }
         state.last_offset = fileSize;
     } catch {
@@ -158,12 +171,15 @@ function analyzeTranscript(transcriptPath: string, state: MonitorState): Monitor
 
 interface ClaudeSettings {
     autoCompactWindow?: unknown;
-    model?: unknown;
 }
 
-function readSettings(path: string): ClaudeSettings {
+interface WindowCache {
+    window?: unknown;
+}
+
+function readJson<T>(path: string): Partial<T> {
     try {
-        return JSON.parse(readFileSync(path, 'utf8')) as ClaudeSettings;
+        return JSON.parse(readFileSync(path, 'utf8')) as Partial<T>;
     } catch {
         return {};
     }
@@ -175,35 +191,44 @@ function parseWindow(value: unknown): number | null {
     return Math.min(MAX_WINDOW, Math.max(MIN_WINDOW, Math.round(n)));
 }
 
-/**
- * Resolve the session's context window, mirroring how Claude Code configures it:
- *   1. CLAUDE_CODE_AUTO_COMPACT_WINDOW env var (per-session override)
- *   2. `autoCompactWindow` from settings (local > project > user)
- *   3. a `[1m]` model alias (hook input or settings) → 1M
- *   4. the 200k default
- * A context already larger than the resolved window can only mean the session
- * is on the extended window, so that bumps it to 1M.
- */
-function resolveContextWindow(input: CommonHookFields, ctx: number): number {
+/** The compaction-window override, when the user configured one. */
+function configuredWindow(input: CommonHookFields): number | null {
     const settingsFiles = [
         ...(input.cwd
             ? [join(input.cwd, '.claude', 'settings.local.json'), join(input.cwd, '.claude', 'settings.json')]
             : []),
         join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'settings.json'),
     ];
-    const settings = settingsFiles.map(readSettings);
-
-    let window =
+    return (
         parseWindow(process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW) ??
-        settings.map((s) => parseWindow(s.autoCompactWindow)).find((w) => w !== null) ??
-        null;
+        settingsFiles.map((f) => parseWindow(readJson<ClaudeSettings>(f).autoCompactWindow)).find((w) => w !== null) ??
+        null
+    );
+}
 
-    if (window === null) {
-        const model = input.model ?? settings.map((s) => s.model).find((m) => typeof m === 'string');
-        window = typeof model === 'string' && /\[1m\]/i.test(model) ? EXTENDED_WINDOW : DEFAULT_WINDOW;
-    }
+/** The live window the window-probe mod cached from `$.session.usage()`. */
+function cachedWindow(sessionId: string): number | null {
+    const w = readJson<WindowCache>(getWindowCachePath(sessionId)).window;
+    return typeof w === 'number' && Number.isFinite(w) && w > 0 ? w : null;
+}
 
-    return ctx > window ? Math.max(window, EXTENDED_WINDOW) : window;
+function windowForModel(model: string | undefined): number {
+    if (!model) return DEFAULT_WINDOW;
+    return WINDOW_BY_MODEL_FAMILY.find(([re]) => re.test(model))?.[1] ?? DEFAULT_WINDOW;
+}
+
+/**
+ * Resolve the session's context window:
+ *   1. CLAUDE_CODE_AUTO_COMPACT_WINDOW / `autoCompactWindow` (local > project > user)
+ *   2. the live window cached by the window-probe mod (follows `/model`)
+ *   3. the model family of the latest transcript entry (Opus/Fable 1M, Sonnet/Haiku 250k)
+ *   4. the 200k default
+ * A context already larger than the resolved window can only mean the session
+ * is on the extended window, so that bumps it to 1M.
+ */
+function resolveContextWindow(input: CommonHookFields, state: MonitorState): number {
+    const window = configuredWindow(input) ?? cachedWindow(input.session_id) ?? windowForModel(state.model);
+    return state.context_length > window ? Math.max(window, EXTENDED_WINDOW) : window;
 }
 
 // ── Evaluation ──────────────────────────────────────────────────────────────
@@ -337,7 +362,7 @@ function runStop(input: CommonHookFields, throttled: boolean): void {
 
     const prevOffset = state.last_offset;
     state = analyzeTranscript(input.transcript_path, state);
-    const verdict = evaluate(state, resolveContextWindow(input, state.context_length));
+    const verdict = evaluate(state, resolveContextWindow(input, state));
     state.last_checked_at = Date.now();
 
     if (state.last_offset !== prevOffset || throttled) {

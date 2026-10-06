@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "build": "esbuild src/context-monitor.ts --bundle --platform=node --target=node20 --format=esm --outfile=hooks/context-monitor.mjs --legal-comments=none --banner:js=\"#!/usr/bin/env node\"",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "typecheck:mod": "tsc -p .claude-plugin/types",
+    "test:mod": "claude plugin test ."
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

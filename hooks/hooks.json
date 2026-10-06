@@ -1,5 +1,8 @@
 {
   "description": "Per-session context-usage monitor: warns the user as token pressure and compression count climb.",
+  "modules": [
+    "./window-probe.ts"
+  ],
   "hooks": {
     "Stop": [
       {

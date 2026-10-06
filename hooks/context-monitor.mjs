@@ -669,6 +669,10 @@ var CONTEXT_STRONG_PCT = 0.75;
 var CONTEXT_CRITICAL_PCT = 0.9;
 var DEFAULT_WINDOW = 2e5;
 var EXTENDED_WINDOW = 1e6;
+var WINDOW_BY_MODEL_FAMILY = [
+  [/opus|fable/i, 1e6],
+  [/sonnet|haiku/i, 25e4]
+];
 var MIN_WINDOW = 1e5;
 var MAX_WINDOW = 1e6;
 var COMPRESS_WARN = 2;
@@ -681,6 +685,9 @@ function getStatePath(sessionId) {
   mkdirSync(STATE_DIR, { recursive: true });
   const safe = sessionId.replace(/[^a-zA-Z0-9-]/g, "_");
   return join(STATE_DIR, `${safe}.json`);
+}
+function getWindowCachePath(sessionId) {
+  return getStatePath(sessionId).replace(/\.json$/, ".window.json");
 }
 function loadState(sessionId) {
   const path = getStatePath(sessionId);
@@ -708,6 +715,7 @@ function analyzeTranscript(transcriptPath, state) {
     readSync(fd, buffer, 0, buffer.length, state.last_offset);
     closeSync(fd);
     let mostRecentUsage = null;
+    let mostRecentModel;
     let mostRecentTime = null;
     for (const line of buffer.toString("utf8").split("\n")) {
       const trimmed = line.trim();
@@ -726,17 +734,19 @@ function analyzeTranscript(transcriptPath, state) {
       if (!mostRecentTime || t > mostRecentTime) {
         mostRecentTime = t;
         mostRecentUsage = usage;
+        mostRecentModel = entry.message?.model;
       }
     }
     if (mostRecentUsage) {
       state.context_length = (mostRecentUsage.input_tokens ?? 0) + (mostRecentUsage.cache_read_input_tokens ?? 0) + (mostRecentUsage.cache_creation_input_tokens ?? 0);
+      if (mostRecentModel) state.model = mostRecentModel;
     }
     state.last_offset = fileSize;
   } catch {
   }
   return state;
 }
-function readSettings(path) {
+function readJson(path) {
   try {
     return JSON.parse(readFileSync2(path, "utf8"));
   } catch {
@@ -748,18 +758,24 @@ function parseWindow(value) {
   if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return null;
   return Math.min(MAX_WINDOW, Math.max(MIN_WINDOW, Math.round(n)));
 }
-function resolveContextWindow(input, ctx) {
+function configuredWindow(input) {
   const settingsFiles = [
     ...input.cwd ? [join(input.cwd, ".claude", "settings.local.json"), join(input.cwd, ".claude", "settings.json")] : [],
     join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"), "settings.json")
   ];
-  const settings = settingsFiles.map(readSettings);
-  let window = parseWindow(process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW) ?? settings.map((s) => parseWindow(s.autoCompactWindow)).find((w) => w !== null) ?? null;
-  if (window === null) {
-    const model = input.model ?? settings.map((s) => s.model).find((m) => typeof m === "string");
-    window = typeof model === "string" && /\[1m\]/i.test(model) ? EXTENDED_WINDOW : DEFAULT_WINDOW;
-  }
-  return ctx > window ? Math.max(window, EXTENDED_WINDOW) : window;
+  return parseWindow(process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW) ?? settingsFiles.map((f) => parseWindow(readJson(f).autoCompactWindow)).find((w) => w !== null) ?? null;
+}
+function cachedWindow(sessionId) {
+  const w = readJson(getWindowCachePath(sessionId)).window;
+  return typeof w === "number" && Number.isFinite(w) && w > 0 ? w : null;
+}
+function windowForModel(model) {
+  if (!model) return DEFAULT_WINDOW;
+  return WINDOW_BY_MODEL_FAMILY.find(([re]) => re.test(model))?.[1] ?? DEFAULT_WINDOW;
+}
+function resolveContextWindow(input, state) {
+  const window = configuredWindow(input) ?? cachedWindow(input.session_id) ?? windowForModel(state.model);
+  return state.context_length > window ? Math.max(window, EXTENDED_WINDOW) : window;
 }
 function maxSeverity(a, b) {
   return SEVERITY_ORDER.indexOf(a) >= SEVERITY_ORDER.indexOf(b) ? a : b;
@@ -860,7 +876,7 @@ function runStop(input, throttled) {
   }
   const prevOffset = state.last_offset;
   state = analyzeTranscript(input.transcript_path, state);
-  const verdict = evaluate(state, resolveContextWindow(input, state.context_length));
+  const verdict = evaluate(state, resolveContextWindow(input, state));
   state.last_checked_at = Date.now();
   if (state.last_offset !== prevOffset || throttled) {
     saveState(input.session_id, state);
